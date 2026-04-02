@@ -14,7 +14,8 @@ namespace HASS.Agent.Managers
         private static readonly SemaphoreSlim Semaphore = new(1, 1);
 
         private static BluetoothLEAdvertisementWatcher _leWatcher;
-        private static readonly List<BluetoothLeDevice> DetectedLeDevices = new();
+        // keyed by BluetoothAddress (ulong) for O(1) lookup without calling FromBluetoothAddressAsync
+        private static readonly Dictionary<ulong, BluetoothLeDevice> DetectedLeDevices = new();
         private static bool _isWatchingLeDevices;
 
         /// <summary>
@@ -76,7 +77,10 @@ namespace HASS.Agent.Managers
 
                 _leWatcher = new BluetoothLEAdvertisementWatcher
                 {
-                    ScanningMode = BluetoothLEScanningMode.Active
+                    // passive mode avoids sending scan-request packets to every advertiser,
+                    // which was causing the Windows Device Association Service to consume
+                    // constant CPU even when all detected devices were already known
+                    ScanningMode = BluetoothLEScanningMode.Passive
                 };
 
                 _leWatcher.Received += ScanOnReceived;
@@ -126,7 +130,7 @@ namespace HASS.Agent.Managers
                 try
                 {
                     // make a copy of the devices
-                    var deviceList = DetectedLeDevices.ToList();
+                    var deviceList = DetectedLeDevices.Values.ToList();
 
                     // if requested, clear the current list
                     if (clearList) DetectedLeDevices.Clear();
@@ -155,11 +159,30 @@ namespace HASS.Agent.Managers
         {
             try
             {
-                // fetch the device based on its address
+                // fast path: if we already know this address just update LastSeenUtc,
+                // avoiding the expensive FromBluetoothAddressAsync call to the
+                // Windows Device Association Service that was the root cause of
+                // constant high CPU usage
+                if (!await Semaphore.WaitAsync(TimeSpan.FromSeconds(5)))
+                    return;
+
+                try
+                {
+                    if (DetectedLeDevices.TryGetValue(args.BluetoothAddress, out var knownDevice))
+                    {
+                        knownDevice.LastSeenUtc = DateTime.UtcNow;
+                        return;
+                    }
+                }
+                finally
+                {
+                    Semaphore.Release();
+                }
+
+                // slow path: first time we've seen this address — resolve via Windows API
                 using var device = await BluetoothLEDevice.FromBluetoothAddressAsync(args.BluetoothAddress);
                 if (device == null) return;
 
-                // prepare the device
                 var leDevice = new BluetoothLeDevice
                 {
                     Id = device.DeviceId,
@@ -168,23 +191,17 @@ namespace HASS.Agent.Managers
                     LastSeenUtc = DateTime.UtcNow
                 };
 
-                // wait for the semaphore before accessing the shared list
                 if (!await Semaphore.WaitAsync(TimeSpan.FromSeconds(5)))
                     return;
 
                 try
                 {
-                    // do we already have it?
-                    var existing = DetectedLeDevices.Find(x => x.Id == device.DeviceId);
-                    if (existing != null)
-                    {
-                        // just update lastseen
-                        existing.LastSeenUtc = DateTime.UtcNow;
-                        return;
-                    }
-
-                    // add it to the list
-                    DetectedLeDevices.Add(leDevice);
+                    // another concurrent call may have added this address while we were
+                    // awaiting FromBluetoothAddressAsync, so use indexer (idempotent)
+                    if (DetectedLeDevices.TryGetValue(args.BluetoothAddress, out var race))
+                        race.LastSeenUtc = DateTime.UtcNow;
+                    else
+                        DetectedLeDevices[args.BluetoothAddress] = leDevice;
                 }
                 finally
                 {
