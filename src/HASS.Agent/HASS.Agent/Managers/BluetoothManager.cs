@@ -120,19 +120,24 @@ namespace HASS.Agent.Managers
             try
             {
                 // wait for the semaphore
-                await Semaphore.WaitAsync(TimeSpan.FromSeconds(5));
+                if (!await Semaphore.WaitAsync(TimeSpan.FromSeconds(5)))
+                    return new List<BluetoothLeDevice>();
 
-                // make a copy of the devices
-                var deviceList = DetectedLeDevices.ToList();
+                try
+                {
+                    // make a copy of the devices
+                    var deviceList = DetectedLeDevices.ToList();
 
-                // if requested, clear the current list
-                if (clearList) DetectedLeDevices.Clear();
+                    // if requested, clear the current list
+                    if (clearList) DetectedLeDevices.Clear();
 
-                // release our semaphore
-                Semaphore?.Release();
-
-                // done
-                return deviceList;
+                    // done
+                    return deviceList;
+                }
+                finally
+                {
+                    Semaphore.Release();
+                }
             }
             catch (Exception ex)
             {
@@ -154,14 +159,6 @@ namespace HASS.Agent.Managers
                 using var device = await BluetoothLEDevice.FromBluetoothAddressAsync(args.BluetoothAddress);
                 if (device == null) return;
 
-                // do we already have it?
-                if (DetectedLeDevices.Any(x => x.Id == device.DeviceId))
-                {
-                    // just update lastseen
-                    DetectedLeDevices.Find(x => x.Id == device.DeviceId)!.LastSeenUtc = DateTime.UtcNow;
-                    return;
-                }
-
                 // prepare the device
                 var leDevice = new BluetoothLeDevice
                 {
@@ -171,14 +168,28 @@ namespace HASS.Agent.Managers
                     LastSeenUtc = DateTime.UtcNow
                 };
 
-                // wait for the semaphore
-                await Semaphore.WaitAsync(TimeSpan.FromSeconds(5));
+                // wait for the semaphore before accessing the shared list
+                if (!await Semaphore.WaitAsync(TimeSpan.FromSeconds(5)))
+                    return;
 
-                // add it to the list
-                DetectedLeDevices.Add(leDevice);
+                try
+                {
+                    // do we already have it?
+                    var existing = DetectedLeDevices.Find(x => x.Id == device.DeviceId);
+                    if (existing != null)
+                    {
+                        // just update lastseen
+                        existing.LastSeenUtc = DateTime.UtcNow;
+                        return;
+                    }
 
-                // done, release our semaphore
-                Semaphore?.Release();
+                    // add it to the list
+                    DetectedLeDevices.Add(leDevice);
+                }
+                finally
+                {
+                    Semaphore.Release();
+                }
             }
             catch (Exception ex)
             {
